@@ -1,8 +1,3 @@
-(cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF'
-diff --git a/README.md b/README.md
---- a/README.md
-+++ b/README.md
-@@ -1,230 +1,242 @@
 -# IDA Pro MCP
 -
 -Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
@@ -477,3 +472,4 @@ diff --git a/README.md b/README.md
 +
 EOF
 )
+
