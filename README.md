@@ -16,6 +16,7 @@ Available functionality:
 - `get_current_function()`: Get the function currently selected by the user.
 - `convert_number(text, size)`: Convert a number (decimal, hexadecimal) to different representations.
 - `list_functions(offset, count)`: List all functions in the database (paginated).
+- `list_functions_filter(offset, count, filter)`: List matching functions (paginated, supports /regex/ or case-insensitive substring).
 - `list_globals_filter(offset, count, filter)`: List matching globals in the database (paginated, filtered).
 - `list_globals(offset, count)`: List all globals in the database (paginated).
 - `list_strings_filter(offset, count, filter)`: List matching strings in the database (paginated, filtered).
@@ -23,9 +24,13 @@ Available functionality:
 - `list_local_types()`: List all Local types in the database.
 - `decompile_function(address)`: Decompile a function at the given address.
 - `disassemble_function(start_address)`: Get assembly code (address: instruction; comment) for a function.
+- `list_exports(offset, count)`: List binary exports (entry points).
+- `list_segments()`: List segments with permissions.
 - `get_xrefs_to(address)`: Get all cross references to the given address.
+- `get_xrefs_from(address)`: Get all cross references from the given address.
 - `get_xrefs_to_field(struct_name, field_name)`: Get all cross references to a named struct field (member).
 - `get_entry_points()`: Get all entry points in the database.
+- `get_function_cfg(start_address)`: Build a simple control-flow graph (edges) for a function.
 - `set_comment(address, comment)`: Set a comment for a given address in the function disassembly and pseudocode.
 - `rename_local_variable(function_address, old_name, new_name)`: Rename a local variable in a function.
 - `rename_global_variable(old_name, new_name)`: Rename a global variable.
@@ -34,6 +39,12 @@ Available functionality:
 - `set_function_prototype(function_address, prototype)`: Set a function's prototype.
 - `declare_c_type(c_declaration)`: Create or update a local type from a C declaration.
 - `set_local_variable_type(function_address, variable_name, new_type)`: Set a local variable's type.
+- `find_bytes(pattern, start, end, max_results)`: Find byte patterns (supports wildcards) and return addresses.
+- `patch_bytes(address, hex_bytes)`: Patch raw bytes at an address.
+- `create_function(address)`: Create a function at the given address.
+- `delete_function(address)`: Delete the function containing the given address.
+- `jump_to(address)`: Jump the UI to a given address.
+- `save_database(path?)`: Save the database, optionally to a given path.
 
 Unsafe functions (`--unsafe` flag required):
 
@@ -85,7 +96,7 @@ _Note_: You need to load a binary in IDA before the plugin menu will show up.
 
 ## Prompt Engineering
 
-LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering the conversion between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
+LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering, conversions between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
 
 > Your task is to analyze a crackme in IDA Pro. You can use the MCP tools to retrieve information. In general use the following strategy:
 > - Inspect the decompilation and add comments with your findings
@@ -102,7 +113,7 @@ This prompt was just the first experiment, please share if you found ways to imp
 
 ## Tips for Enhancing LLM Accuracy
 
-Large Language Models (LLMs) are powerful tools, but they can sometimes struggle with complex mathematical calculations or exhibit "hallucinations" (making up facts). Make sure to tell the LLM to use the `conver_number` MCP and you might also need [math-mcp](https://github.com/EthanHenrickson/math-mcp) for certain operations.
+Large Language Models (LLMs) are powerful tools, but they can sometimes struggle with complex mathematical calculations or exhibit "hallucinations" (making up facts). Make sure to tell the LLM to use the `convert_number` MCP and you might also need [math-mcp](https://github.com/EthanHenrickson/math-mcp) for certain operations.
 
 Another thing to keep in mind is that LLMs will not perform well on obfuscated code. Before trying to use an LLM to solve the problem, take a look around the binary and spend some time (automatically) removing the following things:
 
