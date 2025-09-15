@@ -679,10 +679,22 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
     if not pattern:
         return data
 
-    # TODO: implement /regex/ matching
+    # Support /regex/ syntax (case-insensitive). Falls back to case-insensitive substring.
+    try:
+        if len(pattern) >= 2 and pattern.startswith("/") and pattern.endswith("/"):
+            import re
+            regex = re.compile(pattern[1:-1], re.IGNORECASE)
+
+            def matches(item: T) -> bool:
+                return bool(regex.search(str(item[key])))
+
+            return list(filter(matches, data))
+    except Exception:
+        # If regex compilation fails, fall back to substring
+        pass
 
     def matches(item: T) -> bool:
-        return pattern.lower() in item[key].lower()
+        return pattern.lower() in str(item[key]).lower()
     return list(filter(matches, data))
 
 @jsonrpc
@@ -694,6 +706,234 @@ def list_functions(
     """List all functions in the database (paginated)"""
     functions = [get_function(address) for address in idautils.Functions()]
     return paginate(functions, offset, count)
+
+@jsonrpc
+@idaread
+def list_functions_filter(
+    offset: Annotated[int, "Offset to start listing from (start at 0)"],
+    count: Annotated[int, "Number of functions to list (100 is a good default, 0 means remainder)"],
+    filter: Annotated[str, "Filter to apply to the list (required parameter, empty string for no filter). Case-insensitive contains or /regex/ syntax"],
+) -> Page[Function]:
+    """List matching functions in the database (paginated, filtered)"""
+    functions = [get_function(address) for address in idautils.Functions()]
+    functions = pattern_filter(functions, filter, "name")
+    return paginate(functions, offset, count)
+
+class Export(TypedDict):
+    address: str
+    name: str
+
+@jsonrpc
+@idaread
+def list_exports(
+    offset: Annotated[int, "Offset to start listing from (start at 0)"],
+    count: Annotated[int, "Number of exports to list (100 is a good default, 0 means remainder)"],
+) -> Page[Export]:
+    """List all exports (entry points) in the database (paginated)"""
+    exports: list[Export] = []
+    for i in range(ida_entry.get_entry_qty()):
+        ordinal = ida_entry.get_entry_ordinal(i)
+        address = ida_entry.get_entry(ordinal)
+        name = ida_entry.get_entry_name(ordinal)
+        if not name:
+            name = f"entry_{ordinal}"
+        exports.append(Export(address=hex(address), name=name))
+    return paginate(exports, offset, count)
+
+class Segment(TypedDict):
+    name: str
+    start: str
+    end: str
+    perm: str
+
+@jsonrpc
+@idaread
+def list_segments() -> list[Segment]:
+    """List all segments with permissions"""
+    def perm_to_str(perm: int) -> str:
+        perms: list[str] = []
+        if perm & idaapi.SEGPERM_READ:
+            perms.append("R")
+        if perm & idaapi.SEGPERM_WRITE:
+            perms.append("W")
+        if perm & idaapi.SEGPERM_EXEC:
+            perms.append("X")
+        return "".join(perms) or "-"
+
+    segments: list[Segment] = []
+    seg = idaapi.get_first_seg()
+    while seg:
+        name = idaapi.get_segm_name(seg) or "<anon>"
+        segments.append(Segment(name=name, start=hex(seg.start_ea), end=hex(seg.end_ea), perm=perm_to_str(seg.perm)))
+        seg = idaapi.get_next_seg(seg.start_ea)
+    return segments
+
+class XrefFrom(TypedDict):
+    address: str
+    type: str
+    to: str
+    function: Optional[Function]
+
+@jsonrpc
+@idaread
+def get_xrefs_from(
+    address: Annotated[str, "Address to get cross references from"],
+) -> list[XrefFrom]:
+    """Get all cross references originating at the given address"""
+    results: list[XrefFrom] = []
+    ea = parse_address(address)
+    for xref in idautils.XrefsFrom(ea):
+        results.append(
+            XrefFrom(
+                address=hex(xref.frm),
+                type="code" if xref.iscode else "data",
+                to=hex(xref.to),
+                function=get_function(xref.frm, raise_error=False),
+            )
+        )
+    return results
+
+class CFGEdge(TypedDict):
+    frm: str
+    to: str
+
+class CFG(TypedDict):
+    start_ea: str
+    edges: list[CFGEdge]
+
+@jsonrpc
+@idaread
+def get_function_cfg(
+    start_address: Annotated[str, "Address of the function to build a control flow graph for"],
+) -> CFG:
+    """Build a simple control flow graph (edges) of a function"""
+    start = parse_address(start_address)
+    func = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found containing address {start_address}")
+
+    edges: list[CFGEdge] = []
+    try:
+        fc = idaapi.FlowChart(func)
+    except Exception:
+        # Older IDA versions
+        fc = ida_gdl.FlowChart(func)
+
+    for block in fc:
+        for succ in block.succs():
+            edges.append(CFGEdge(frm=hex(block.start_ea), to=hex(succ.start_ea)))
+
+    return CFG(start_ea=hex(func.start_ea), edges=edges)
+
+@jsonrpc
+@idaread
+def find_bytes(
+    pattern: Annotated[str, "Byte pattern to search for, e.g. 'DE AD BE EF' or with ? wildcards"],
+    start: Annotated[Optional[str], "Start address (default: min ea)"],
+    end: Annotated[Optional[str], "End address (default: max ea)"],
+    max_results: Annotated[Optional[int], "Maximum number of results to return (default: 100)"],
+) -> list[str]:
+    """Search for a byte pattern and return matching addresses"""
+    try:
+        begin = parse_address(start) if start else ida_ida.inf_get_min_ea()
+        finish = parse_address(end) if end else ida_ida.inf_get_max_ea()
+    except Exception:
+        begin = ida_ida.inf_get_min_ea()
+        finish = ida_ida.inf_get_max_ea()
+
+    if max_results is None:
+        max_results = 100
+
+    results: list[str] = []
+    ea = begin
+    while ea != idaapi.BADADDR and ea < finish:
+        try:
+            # Try modern API first
+            found = ida_bytes.find_bytes(ea, finish, pattern, 16, ida_bytes.SEARCH_DOWN)
+        except Exception:
+            # Fallback to legacy API
+            found = idaapi.find_binary(ea, finish, pattern, 16, idaapi.SEARCH_DOWN)
+        if found == idaapi.BADADDR or found >= finish:
+            break
+        results.append(hex(found))
+        if len(results) >= max_results:
+            break
+        ea = found + 1
+    return results
+
+@jsonrpc
+@idawrite
+def patch_bytes(
+    address: Annotated[str, "Starting address to apply raw bytes patch"],
+    hex_bytes: Annotated[str, "Bytes as hex string, e.g. '90 90 90'"],
+) -> str:
+    """Patch raw bytes at an address"""
+    ea = parse_address(address)
+    try:
+        cleaned = bytes.fromhex(hex_bytes.replace(" ", ""))
+    except Exception:
+        raise IDAError("Invalid hex byte string")
+    try:
+        ida_bytes.patch_bytes(ea, cleaned)
+    except Exception:
+        raise IDAError(f"Failed to patch bytes at address {hex(ea)}")
+    return f"Patched {len(cleaned)} bytes"
+
+@jsonrpc
+@idawrite
+def create_function(
+    address: Annotated[str, "Start address to create a function at"],
+) -> str:
+    """Create a function at the specified address"""
+    ea = parse_address(address)
+    if ida_funcs.add_func(ea):
+        return f"Function created at {hex(ea)}"
+    raise IDAError(f"Failed to create function at {hex(ea)}")
+
+@jsonrpc
+@idawrite
+def delete_function(
+    address: Annotated[str, "Address of the function to delete"],
+) -> str:
+    """Delete the function containing the specified address"""
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found containing address {hex(ea)}")
+    if ida_funcs.del_func(func.start_ea):
+        return f"Function deleted at {hex(func.start_ea)}"
+    raise IDAError(f"Failed to delete function at {hex(func.start_ea)}")
+
+@jsonrpc
+@idaread
+def jump_to(
+    address: Annotated[str, "Address to jump to in the UI"],
+) -> str:
+    """Jump the UI to a given address (no-op in headless)"""
+    ea = parse_address(address)
+    try:
+        ida_kernwin.jumpto(ea)
+    except Exception:
+        pass
+    return f"Jumped to {hex(ea)}"
+
+@jsonrpc
+@idawrite
+def save_database(
+    path: Annotated[Optional[str], "Optional file path to save as; default: current IDB"],
+) -> str:
+    """Save the current database"""
+    try:
+        if path:
+            if not idaapi.save_database(path, 0):
+                raise IDAError(f"Failed to save database to {path}")
+            return f"Database saved to {path}"
+        else:
+            if not idaapi.save_database(None, 0):
+                raise IDAError("Failed to save database")
+            return "Database saved"
+    except Exception as e:
+        raise IDAError(str(e))
 
 class Global(TypedDict):
     address: str
