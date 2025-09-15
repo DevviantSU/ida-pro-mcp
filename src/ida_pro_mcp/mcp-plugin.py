@@ -266,6 +266,7 @@ import ida_name
 import ida_ida
 import ida_frame
 import re
+import time
 
 class IDAError(Exception):
     def __init__(self, message: str):
@@ -935,6 +936,284 @@ def save_database(
             return "Database saved"
     except Exception as e:
         raise IDAError(str(e))
+
+# ---------------------------
+# Caching & batch operations
+# ---------------------------
+
+DECOMPILE_CACHE: dict[int, tuple[str, float]] = {}
+DISASM_CACHE: dict[int, tuple[dict, float]] = {}
+CFG_CACHE: dict[int, tuple[dict, float]] = {}
+
+def _render_pseudocode(cfunc: ida_hexrays.cfunc_t) -> str:
+    sv = cfunc.get_pseudocode()
+    pseudocode = ""
+    for i, sl in enumerate(sv):
+        sl: ida_kernwin.simpleline_t
+        item = ida_hexrays.ctree_item_t()
+        addr = None if i > 0 else cfunc.entry_ea
+        if cfunc.get_line_item(sl.line, 0, False, None, item, None):
+            ds = item.dstr().split(": ")
+            if len(ds) == 2:
+                try:
+                    addr = int(ds[0], 16)
+                except ValueError:
+                    pass
+        line = ida_lines.tag_remove(sl.line)
+        if len(pseudocode) > 0:
+            pseudocode += "\n"
+        if not addr:
+            pseudocode += f"/* line: {i} */ {line}"
+        else:
+            pseudocode += f"/* line: {i}, address: {hex(addr)} */ {line}"
+    return pseudocode
+
+def _get_cached_decompile(address: int, max_lines: Optional[int]) -> tuple[str, bool]:
+    now = time.time()
+    entry = DECOMPILE_CACHE.get(address)
+    if entry is None:
+        cfunc = decompile_checked(address)
+        text = _render_pseudocode(cfunc)
+        DECOMPILE_CACHE[address] = (text, now)
+    else:
+        text = entry[0]
+    if max_lines and max_lines > 0:
+        limited = "\n".join(text.splitlines()[:max_lines])
+        return limited, len(text.splitlines()) > max_lines
+    return text, False
+
+def _build_disassembly_cached(start: int) -> dict:
+    now = time.time()
+    entry = DISASM_CACHE.get(start)
+    if entry is not None:
+        return entry[0]
+    # Reuse existing disassemble_function logic
+    func: ida_funcs.func_t = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found containing address {hex(start)}")
+    lines = []
+    for address in ida_funcs.func_item_iterator_t(func):
+        seg = idaapi.getseg(address)
+        segment = idaapi.get_segm_name(seg) if seg else None
+        label = idc.get_name(address, 0)
+        if label and label == func.name and address == func.start_ea:
+            label = None
+        if label == "":
+            label = None
+        comments = []
+        if comment := idaapi.get_cmt(address, False):
+            comments += [comment]
+        if comment := idaapi.get_cmt(address, True):
+            comments += [comment]
+        raw_instruction = idaapi.generate_disasm_line(address, 0)
+        tls = ida_kernwin.tagged_line_sections_t()
+        ida_kernwin.parse_tagged_line_sections(tls, raw_instruction)
+        insn_section = tls.first(ida_lines.COLOR_INSN)
+        operands = []
+        for op_tag in range(ida_lines.COLOR_OPND1, ida_lines.COLOR_OPND8 + 1):
+            op_n = tls.first(op_tag)
+            if not op_n:
+                break
+            op: str = op_n.substr(raw_instruction)
+            op_str = ida_lines.tag_remove(op)
+            for idx in range(len(op) - 2):
+                if op[idx] != idaapi.COLOR_ON:
+                    continue
+                idx += 1
+                if ord(op[idx]) != idaapi.COLOR_ADDR:
+                    continue
+                idx += 1
+                addr_string = op[idx:idx + idaapi.COLOR_ADDR_SIZE]
+                idx += idaapi.COLOR_ADDR_SIZE
+                addr = int(addr_string, 16)
+                symbol = op[idx:op.find(idaapi.COLOR_OFF, idx)]
+                if symbol == '':
+                    symbol = op_str
+                comments += [f"{symbol}={addr:#x}"]
+                try:
+                    value = get_global_variable_value_internal(addr)
+                except:
+                    continue
+                comments += [f"*{symbol}={value}"]
+            operands += [op_str]
+        mnem = ida_lines.tag_remove(insn_section.substr(raw_instruction))
+        instruction = f"{mnem} {', '.join(operands)}"
+        line = {
+            "address": f"{address:#x}",
+            "instruction": instruction,
+        }
+        if len(comments) > 0:
+            line.update(comments=comments)
+        if segment:
+            line.update(segment=segment)
+        if label:
+            line.update(label=label)
+        lines += [line]
+    prototype = func.get_prototype()
+    arguments = [
+        {"name": arg.name, "type": f"{arg.type}"} for arg in prototype.iter_func()
+    ] if prototype else None
+    disassembly_function = {
+        "name": func.name,
+        "start_ea": f"{func.start_ea:#x}",
+        "stack_frame": get_stack_frame_variables_internal(func.start_ea),
+        "lines": lines
+    }
+    if prototype:
+        disassembly_function.update(return_type=f"{prototype.get_rettype()}")
+    if arguments:
+        disassembly_function.update(arguments=arguments)
+    DISASM_CACHE[start] = (disassembly_function, now)
+    return disassembly_function
+
+def _build_cfg_cached(start: int) -> dict:
+    now = time.time()
+    entry = CFG_CACHE.get(start)
+    if entry is not None:
+        return entry[0]
+    func = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found containing address {hex(start)}")
+    edges: list[dict] = []
+    try:
+        fc = idaapi.FlowChart(func)
+    except Exception:
+        fc = ida_gdl.FlowChart(func)
+    for block in fc:
+        for succ in block.succs():
+            edges.append({"frm": hex(block.start_ea), "to": hex(succ.start_ea)})
+    cfg = {"start_ea": hex(func.start_ea), "edges": edges}
+    CFG_CACHE[start] = (cfg, now)
+    return cfg
+
+@jsonrpc
+@idawrite
+def clear_analysis_caches():
+    """Clear in-memory caches used by analyze and batch endpoints"""
+    DECOMPILE_CACHE.clear()
+    DISASM_CACHE.clear()
+    CFG_CACHE.clear()
+
+@jsonrpc
+@idaread
+def cache_stats() -> dict:
+    """Return sizes of internal caches"""
+    return {
+        "decompile": len(DECOMPILE_CACHE),
+        "disassembly": len(DISASM_CACHE),
+        "cfg": len(CFG_CACHE),
+    }
+
+def _parse_many(text: str) -> list[str]:
+    if not text:
+        return []
+    parts = re.split(r"[\s,;]+", text.strip())
+    return [p for p in parts if p]
+
+@jsonrpc
+@idaread
+def batch_decompile(
+    addresses: Annotated[str, "Addresses separated by space/comma/newline"],
+    max_lines: Annotated[Optional[int], "Limit pseudocode lines per function (0=full)"],
+) -> dict:
+    """Decompile multiple functions with optional line limit (cached)"""
+    result: dict[str, dict] = {}
+    for addr_str in _parse_many(addresses):
+        addr = parse_address(addr_str)
+        try:
+            text, truncated = _get_cached_decompile(addr, max_lines)
+            result[addr_str] = {"pseudocode": text, "truncated": truncated}
+        except DecompilerLicenseError as e:
+            result[addr_str] = {"error": str(e)}
+        except Exception as e:
+            result[addr_str] = {"error": str(e)}
+    return result
+
+@jsonrpc
+@idaread
+def batch_get_xrefs_to(
+    addresses: Annotated[str, "Addresses separated by space/comma/newline"],
+) -> dict:
+    """Get xrefs to many addresses in one call"""
+    result: dict[str, list] = {}
+    for addr_str in _parse_many(addresses):
+        try:
+            addr = parse_address(addr_str)
+            xrefs = []
+            for xref in idautils.XrefsTo(addr):
+                xrefs.append({
+                    "address": hex(xref.frm),
+                    "type": "code" if xref.iscode else "data",
+                    "function": get_function(xref.frm, raise_error=False),
+                })
+            result[addr_str] = xrefs
+        except Exception as e:
+            result[addr_str] = [{"error": str(e)}]
+    return result
+
+@jsonrpc
+@idaread
+def analyze_function_deep(
+    address: Annotated[str, "Function start or any address within function"],
+    include_disassembly: Annotated[Optional[bool], "Include structured disassembly (default False)"],
+    include_cfg: Annotated[Optional[bool], "Include CFG edges (default True)"],
+    max_pseudocode_lines: Annotated[Optional[int], "Limit pseudocode lines (0=full)"],
+) -> dict:
+    """Collect pseudocode (cached), callers/callees/xrefs, optional disassembly and CFG"""
+    addr = parse_address(address)
+    func = idaapi.get_func(addr)
+    if not func:
+        raise IDAError(f"No function found containing address {address}")
+    start = func.start_ea
+    pseudo, truncated = _get_cached_decompile(start, max_pseudocode_lines)
+    callers = get_callers(hex(start))
+    callees = get_callees(hex(start))
+    xrefs_to = get_xrefs_to(hex(start))
+    result: dict = {
+        "function": get_function(start),
+        "pseudocode": pseudo,
+        "pseudocode_truncated": truncated,
+        "callers": callers,
+        "callees": callees,
+        "xrefs_to": xrefs_to,
+    }
+    if include_cfg is None or include_cfg:
+        result["cfg"] = _build_cfg_cached(start)
+    if include_disassembly:
+        result["disassembly"] = _build_disassembly_cached(start)
+    return result
+
+@jsonrpc
+@idaread
+def analyze_binary_summary() -> dict:
+    """Lightweight summary: counts and quick facts to guide next steps"""
+    num_functions = sum(1 for _ in idautils.Functions())
+    num_strings = sum(1 for _ in idautils.Strings())
+    num_globals = sum(1 for ea, name in idautils.Names() if not idaapi.get_func(ea))
+    num_import_mods = ida_nalt.get_import_module_qty()
+    num_exports = ida_entry.get_entry_qty()
+    num_segments = 0
+    seg = idaapi.get_first_seg()
+    while seg:
+        num_segments += 1
+        seg = idaapi.get_next_seg(seg.start_ea)
+    # local types count
+    idati = ida_typeinf.get_idati()
+    num_types = ida_typeinf.get_ordinal_limit(idati)
+    entries = [get_function(ida_entry.get_entry(ida_entry.get_entry_ordinal(i)), raise_error=False)
+               for i in range(ida_entry.get_entry_qty())]
+    entries = [e for e in entries if e]
+    return {
+        "module": idaapi.get_root_filename(),
+        "functions": num_functions,
+        "strings": num_strings,
+        "globals": num_globals,
+        "import_modules": num_import_mods,
+        "exports": num_exports,
+        "segments": num_segments,
+        "types": num_types,
+        "entries": entries,
+    }
 
 class Global(TypedDict):
     address: str

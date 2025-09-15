@@ -50,6 +50,12 @@ Available functionality:
 - `delete_function(address)`: Delete the function containing the given address.
 - `jump_to(address)`: Jump the UI to a given address.
 - `save_database(path?)`: Save the database, optionally to a given path.
+- `clear_analysis_caches()`: Clear in-memory caches used by batch/analysis endpoints.
+- `cache_stats()`: Show sizes of internal caches.
+- `batch_decompile(addresses, max_lines)`: Decompile multiple functions in one call (cached, optional line limit).
+- `batch_get_xrefs_to(addresses)`: Fetch xrefs-to for many addresses in one call.
+- `analyze_function_deep(address, include_disassembly?, include_cfg?, max_pseudocode_lines?)`: Deep per-function summary.
+- `analyze_binary_summary()`: Lightweight binary-wide summary to guide next steps.
 
 Unsafe functions (`--unsafe` flag required):
 
