@@ -1215,6 +1215,172 @@ def analyze_binary_summary() -> dict:
         "entries": entries,
     }
 
+# ---------------------------
+# Ranking and additional batch
+# ---------------------------
+
+def _is_string_ea(ea: int) -> bool:
+    try:
+        data = idaapi.get_strlit_contents(ea, -1, 0)
+        return data is not None and len(data) > 0
+    except Exception:
+        return False
+
+@jsonrpc
+@idaread
+def rank_functions(
+    sort_by: Annotated[str, "One of: xrefs, blocks, string_refs, score"],
+    top_n: Annotated[Optional[int], "How many results to return (default 50)"]
+) -> list[dict]:
+    """Rank functions by callers (xrefs), basic blocks, and string refs (unique)"""
+    if not sort_by:
+        sort_by = "score"
+    sort_by = sort_by.lower()
+    if sort_by not in {"xrefs", "blocks", "string_refs", "score"}:
+        raise IDAError(f"Invalid sort_by: {sort_by}")
+    if not top_n or top_n <= 0:
+        top_n = 50
+
+    results: list[dict] = []
+    for fn_ea in idautils.Functions():
+        func = idaapi.get_func(fn_ea)
+        if not func:
+            continue
+
+        # callers (xrefs) to function start; keep only call sites
+        callers = 0
+        for ref in idautils.CodeRefsTo(func.start_ea, 0):
+            insn = idaapi.insn_t()
+            if idaapi.decode_insn(insn, ref):
+                if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
+                    callers += 1
+
+        # blocks via FlowChart
+        try:
+            fc = idaapi.FlowChart(func)
+        except Exception:
+            fc = ida_gdl.FlowChart(func)
+        blocks = sum(1 for _ in fc)
+
+        # unique strings referenced from instructions in function
+        str_targets: set[int] = set()
+        it = ida_funcs.func_item_iterator_t(func)
+        while it.next_addr():
+            ea = it.current()
+            try:
+                for dref in idautils.DataRefsFrom(ea):
+                    if dref not in str_targets and _is_string_ea(dref):
+                        str_targets.add(dref)
+            except Exception:
+                continue
+        str_refs = len(str_targets)
+
+        score = callers * 3 + blocks * 2 + str_refs
+
+        try:
+            name = func.get_name()
+        except AttributeError:
+            name = ida_funcs.get_func_name(func.start_ea)
+
+        entry = {
+            "address": f"{func.start_ea:#x}",
+            "name": name,
+            "xrefs": callers,
+            "blocks": blocks,
+            "string_refs": str_refs,
+            "score": score,
+        }
+        results.append(entry)
+
+    key = sort_by
+    results.sort(key=lambda x: x[key] if key != "score" else x["score"], reverse=True)
+    return results[:top_n]
+
+@jsonrpc
+@idaread
+def batch_cfg(
+    addresses: Annotated[str, "Function starts or addresses within functions, separated by space/comma/newline"],
+) -> dict:
+    """Return CFG for many functions in one call (cached)"""
+    result: dict[str, dict] = {}
+    for addr_str in _parse_many(addresses):
+        try:
+            ea = parse_address(addr_str)
+            func = idaapi.get_func(ea)
+            if not func:
+                raise IDAError("No function")
+            result[addr_str] = _build_cfg_cached(func.start_ea)
+        except Exception as e:
+            result[addr_str] = {"error": str(e)}
+    return result
+
+@jsonrpc
+@idaread
+def batch_disassemble(
+    addresses: Annotated[str, "Function starts or addresses within functions, separated by space/comma/newline"],
+) -> dict:
+    """Return structured disassembly for many functions in one call (cached)"""
+    result: dict[str, dict] = {}
+    for addr_str in _parse_many(addresses):
+        try:
+            ea = parse_address(addr_str)
+            func = idaapi.get_func(ea)
+            if not func:
+                raise IDAError("No function")
+            result[addr_str] = _build_disassembly_cached(func.start_ea)
+        except Exception as e:
+            result[addr_str] = {"error": str(e)}
+    return result
+
+class StringRefHit(TypedDict):
+    string_ea: str
+    string: str
+    refs: list[Function]
+
+@jsonrpc
+@idaread
+def refs_to_strings_filter(
+    filter: Annotated[str, "Filter to apply to strings (case-insensitive or /regex/)"],
+    limit_per_string: Annotated[Optional[int], "Max ref functions per string (default 50)"]
+) -> list[StringRefHit]:
+    """For strings matching a filter, return referencing functions (deduped)"""
+    if not limit_per_string or limit_per_string <= 0:
+        limit_per_string = 50
+    # collect strings
+    candidates = []
+    for item in idautils.Strings():
+        try:
+            s = str(item)
+            if s:
+                candidates.append({"ea": item.ea, "string": s})
+        except Exception:
+            continue
+    # filter
+    filtered = pattern_filter(
+        [
+            {"address": hex(c["ea"]), "name": c["string"]}  # reuse pattern_filter schema
+            for c in candidates
+        ],
+        filter,
+        "name",
+    )
+    # build hits
+    hits: list[StringRefHit] = []
+    for entry in filtered:
+        sea = parse_address(entry["address"])
+        funcs: dict[str, Function] = {}
+        for xr in idautils.XrefsTo(sea):
+            if not xr.iscode:
+                continue
+            fn = get_function(xr.frm, raise_error=False)
+            if not fn:
+                continue
+            funcs[fn["address"]] = fn
+            if len(funcs) >= limit_per_string:
+                break
+        hits.append(StringRefHit(string_ea=entry["address"], string=entry["name"], refs=list(funcs.values())))
+    return hits
+
 class Global(TypedDict):
     address: str
     name: str

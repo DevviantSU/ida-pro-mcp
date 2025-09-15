@@ -57,6 +57,10 @@ Available functionality:
 - `batch_get_xrefs_to(addresses)`: Fetch xrefs-to for many addresses in one call.
 - `analyze_function_deep(address, include_disassembly?, include_cfg?, max_pseudocode_lines?)`: Deep per-function summary.
 - `analyze_binary_summary()`: Lightweight binary-wide summary to guide next steps.
+- `rank_functions(sort_by, top_n?)`: Rank functions by `xrefs`, `blocks`, `string_refs`, or overall `score`.
+- `batch_cfg(addresses)`: Get CFG for many functions in one call.
+- `batch_disassemble(addresses)`: Get structured disassembly for many functions in one call.
+- `refs_to_strings_filter(filter, limit_per_string?)`: For strings matching a filter, list referencing functions.
 
 Unsafe functions (`--unsafe` flag required):
 
