@@ -265,6 +265,7 @@ import ida_dbg
 import ida_name
 import ida_ida
 import ida_frame
+import re
 
 class IDAError(Exception):
     def __init__(self, message: str):
@@ -2373,6 +2374,199 @@ def dbg_enable_breakpoint(
     if idaapi.enable_bpt(ea, enable):
         return f"Breakpoint {'enabled' if enable else 'disabled'} at {hex(ea)}"
     return f"Failed to {'' if enable else 'disable '}breakpoint at address {hex(ea)}"
+
+# --- Protection and anti-analysis detection ---
+
+class ProtectionIndicator(TypedDict):
+    category: str
+    name: str
+    evidence: list[str]
+    addresses: NotRequired[list[str]]
+    confidence: NotRequired[str]
+
+def _collect_imports() -> list[Import]:
+    rv = []
+    nimps = ida_nalt.get_import_module_qty()
+    for i in range(nimps):
+        module_name = ida_nalt.get_import_module_name(i) or "<unnamed>"
+        def imp_cb(ea, symbol_name, ordinal, acc):
+            if not symbol_name:
+                symbol_name = f"#{ordinal}"
+            acc += [Import(address=hex(ea), imported_name=symbol_name, module=module_name)]
+            return True
+        imp_cb_w_context = lambda ea, symbol_name, ordinal: imp_cb(ea, symbol_name, ordinal, rv)
+        ida_nalt.enum_import_names(i, imp_cb_w_context)
+    return rv
+
+def _get_xrefs_to_ea(ea: int, limit: int = 64) -> list[str]:
+    addrs: list[str] = []
+    for xref in idautils.XrefsTo(ea):
+        addrs.append(hex(xref.frm))
+        if len(addrs) >= limit:
+            break
+    return addrs
+
+@jsonrpc
+@idaread
+def list_suspicious_apis() -> list[ProtectionIndicator]:
+    """List suspicious anti-debug/anti-VM/tamper-related APIs and their xrefs"""
+    suspicious: dict[str, list[str]] = {
+        "anti_debug": [
+            "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "OutputDebugStringA", "OutputDebugStringW",
+            "NtQueryInformationProcess", "ZwQueryInformationProcess",
+            "NtSetInformationThread", "ZwSetInformationThread",
+            "DebugActiveProcess", "DebugActiveProcessStop",
+            "GetThreadContext", "SetThreadContext", "ContinueDebugEvent",
+        ],
+        "timing": [
+            "QueryPerformanceCounter", "GetTickCount", "GetTickCount64", "timeGetTime",
+        ],
+        "exceptions": [
+            "RaiseException", "SetUnhandledExceptionFilter", "AddVectoredExceptionHandler",
+        ],
+        "vm_artifacts": [
+            "RegOpenKeyA", "RegOpenKeyW", "RegQueryValueExA", "RegQueryValueExW",
+        ],
+        "anti_attach": [
+            "NtSetInformationProcess", "ZwSetInformationProcess",
+        ],
+    }
+
+    imports = _collect_imports()
+    by_name: dict[str, list[Import]] = {}
+    for imp in imports:
+        by_name.setdefault(imp["imported_name"], []).append(imp)
+
+    indicators: list[ProtectionIndicator] = []
+    for category, names in suspicious.items():
+        for name in names:
+            if name not in by_name:
+                continue
+            for imp in by_name[name]:
+                try:
+                    ea = parse_address(imp["address"])
+                except Exception:
+                    continue
+                addresses = _get_xrefs_to_ea(ea, 64)
+                indicators.append(ProtectionIndicator(
+                    category=category,
+                    name=f"{imp['module']}!{name}",
+                    evidence=[f"import@{imp['address']}"] + (addresses[:1] if addresses else []),
+                    addresses=addresses if addresses else None,  # type: ignore
+                    confidence="medium",
+                ))
+    return indicators
+
+@jsonrpc
+@idaread
+def find_anti_vm_artifacts() -> list[ProtectionIndicator]:
+    """Find common anti-VM artifacts via strings and section names"""
+    vm_patterns = [
+        "vbox", "virtualbox", "vmware", "vmtools", "qemu", "xen", "hyper-v", "kvm", "parallels",
+        "vmm", "guest", "innotek", "vboxservice", "vboxtray",
+    ]
+    indicators: list[ProtectionIndicator] = []
+
+    # Strings
+    for s in idautils.Strings():
+        try:
+            text = str(s)
+        except Exception:
+            continue
+        low = text.lower()
+        for pat in vm_patterns:
+            if pat in low:
+                indicators.append(ProtectionIndicator(
+                    category="vm_artifact",
+                    name="string",
+                    evidence=[f"{hex(s.ea)}: {text}"]
+                ))
+                break
+
+    # Section names often used by packers/protectors
+    packed_names = [
+        "upx0", "upx1", "upx2", ".upx", ".aspack", ".asprotect", ".themida", ".vmp", ".vmprotect",
+        ".enigma", ".obsidium", ".petite", ".mpress", ".kkrunchy",
+    ]
+    seg = idaapi.get_first_seg()
+    while seg:
+        name = idaapi.get_segm_name(seg) or ""
+        if name.lower() in packed_names:
+            indicators.append(ProtectionIndicator(
+                category="packer",
+                name=name,
+                evidence=[f"segment {name} {hex(seg.start_ea)}-{hex(seg.end_ea)}"],
+                confidence="high",
+            ))
+        seg = idaapi.get_next_seg(seg.start_ea)
+
+    return indicators
+
+@jsonrpc
+@idaread
+def find_timing_and_cpu_checks() -> list[ProtectionIndicator]:
+    """Find RDTSC/CPUID/syscall/int 2e usage heuristics"""
+    mnems = {"rdtsc", "cpuid", "syscall"}
+    indicators: list[ProtectionIndicator] = []
+    for fn_ea in idautils.Functions():
+        func = idaapi.get_func(fn_ea)
+        if not func:
+            continue
+        it = ida_funcs.func_item_iterator_t(func)
+        while it.next_addr():
+            ea = it.current()
+            try:
+                mnem = idaapi.print_insn_mnem(ea).lower()
+            except Exception:
+                mnem = ""
+            if mnem in mnems:
+                indicators.append(ProtectionIndicator(
+                    category="timing" if mnem == "rdtsc" else ("cpuid" if mnem == "cpuid" else "syscall"),
+                    name=mnem,
+                    evidence=[hex(ea)],
+                ))
+            else:
+                # int 2e legacy syscall
+                raw = idaapi.generate_disasm_line(ea, 0) or ""
+                if raw and re.search(r"\bint\s+2e\b", ida_lines.tag_remove(raw), re.IGNORECASE):
+                    indicators.append(ProtectionIndicator(
+                        category="syscall",
+                        name="int 2e",
+                        evidence=[hex(ea)],
+                    ))
+    return indicators
+
+@jsonrpc
+@idaread
+def detect_protections() -> list[ProtectionIndicator]:
+    """Aggregate protection indicators (imports, strings, sections, instructions)"""
+    results: list[ProtectionIndicator] = []
+    try:
+        results += list_suspicious_apis()
+    except Exception:
+        pass
+    try:
+        results += find_anti_vm_artifacts()
+    except Exception:
+        pass
+    try:
+        results += find_timing_and_cpu_checks()
+    except Exception:
+        pass
+    return results
+
+@jsonrpc
+@idaread
+def summarize_protections() -> dict:
+    """Summarize protection indicators by category and name"""
+    indicators = detect_protections()
+    summary: dict[str, dict[str, int]] = {}
+    for ind in indicators:
+        cat = ind["category"]
+        name = ind["name"]
+        summary.setdefault(cat, {})
+        summary[cat][name] = summary[cat].get(name, 0) + 1
+    return {"counts": summary, "total": len(indicators)}
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP

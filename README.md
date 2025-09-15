@@ -39,6 +39,11 @@ Available functionality:
 - `set_function_prototype(function_address, prototype)`: Set a function's prototype.
 - `declare_c_type(c_declaration)`: Create or update a local type from a C declaration.
 - `set_local_variable_type(function_address, variable_name, new_type)`: Set a local variable's type.
+- `list_suspicious_apis()`: List suspicious anti-debug/anti-VM/tamper-related APIs and their xrefs.
+- `find_anti_vm_artifacts()`: Find common anti-VM artifacts via strings and section names.
+- `find_timing_and_cpu_checks()`: Find RDTSC/CPUID/syscall/int 2e usage heuristics.
+- `detect_protections()`: Aggregate protection indicators (imports, strings, sections, instructions).
+- `summarize_protections()`: Summarize protection indicators by category and name.
 - `find_bytes(pattern, start, end, max_results)`: Find byte patterns (supports wildcards) and return addresses.
 - `patch_bytes(address, hex_bytes)`: Patch raw bytes at an address.
 - `create_function(address)`: Create a function at the given address.
@@ -111,7 +116,7 @@ LLMs are prone to hallucinations and you need to be specific with your prompting
 
 This prompt was just the first experiment, please share if you found ways to improve the output!
 
-## Tips for Enhancing LLM Accuracy
+## Tips for Enhancing LLM Accuracy & Ethics
 
 Large Language Models (LLMs) are powerful tools, but they can sometimes struggle with complex mathematical calculations or exhibit "hallucinations" (making up facts). Make sure to tell the LLM to use the `convert_number` MCP and you might also need [math-mcp](https://github.com/EthanHenrickson/math-mcp) for certain operations.
 
@@ -124,6 +129,8 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 - Anti-decompilation tricks
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
+
+Ethical note: These detection features are intended for defensive reverse engineering, malware analysis, and compatibility research. Do not use them to violate software licenses, bypass DRM/anti-cheat of live services, or engage in unlawful activity. Always ensure you have authorization and comply with applicable laws/ToS.
 
 ## SSE Transport & Headless MCP
 
