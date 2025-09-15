@@ -2665,6 +2665,7 @@ class ProtectionIndicator(TypedDict):
 
 def _collect_imports() -> list[Import]:
     rv = []
+    # PE/ELF imports via IDA API
     nimps = ida_nalt.get_import_module_qty()
     for i in range(nimps):
         module_name = ida_nalt.get_import_module_name(i) or "<unnamed>"
@@ -2675,6 +2676,20 @@ def _collect_imports() -> list[Import]:
             return True
         imp_cb_w_context = lambda ea, symbol_name, ordinal: imp_cb(ea, symbol_name, ordinal, rv)
         ida_nalt.enum_import_names(i, imp_cb_w_context)
+
+    # ELF PLT/GOT heuristics: scan named functions in .plt/.plt.sec segments
+    try:
+        for ea, name in idautils.Names():
+            if not name:
+                continue
+            seg = idaapi.getseg(ea)
+            if not seg:
+                continue
+            segname = idaapi.get_segm_name(seg) or ""
+            if segname.lower().startswith(".plt") or segname.lower().startswith(".got"):
+                rv += [Import(address=hex(ea), imported_name=name, module="<plt>")]
+    except Exception:
+        pass
     return rv
 
 def _get_xrefs_to_ea(ea: int, limit: int = 64) -> list[str]:
@@ -2685,13 +2700,26 @@ def _get_xrefs_to_ea(ea: int, limit: int = 64) -> list[str]:
             break
     return addrs
 
+def _normalize_import_name(name: str) -> str:
+    # strip leading underscores and stdcall suffixes like @16, and unify A/W suffix
+    n = name.strip()
+    if n.startswith("_"):
+        n = n[1:]
+    # remove stdcall bytes suffix (e.g., FunctionName@16)
+    n = re.sub(r"@\d+$", "", n)
+    # collapse A/W variants by removing trailing 'A' or 'W' if present
+    if len(n) > 1 and n[-1] in ("A", "W") and n[-2:].lower() not in ("ex",):
+        # Only drop if base exists without obvious two-letter suffix like 'Ex'
+        n = n[:-1]
+    return n.lower()
+
 @jsonrpc
 @idaread
 def list_suspicious_apis() -> list[ProtectionIndicator]:
     """List suspicious anti-debug/anti-VM/tamper-related APIs and their xrefs"""
     suspicious: dict[str, list[str]] = {
         "anti_debug": [
-            "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "OutputDebugStringA", "OutputDebugStringW",
+            "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "OutputDebugString",
             "NtQueryInformationProcess", "ZwQueryInformationProcess",
             "NtSetInformationThread", "ZwSetInformationThread",
             "DebugActiveProcess", "DebugActiveProcessStop",
@@ -2709,31 +2737,40 @@ def list_suspicious_apis() -> list[ProtectionIndicator]:
         "anti_attach": [
             "NtSetInformationProcess", "ZwSetInformationProcess",
         ],
+        # Linux/Unix heuristics (when analyzing ELF)
+        "posix_anti_debug": [
+            "ptrace", "prctl", "sysctl", "seccomp", "syscall",
+        ],
     }
 
     imports = _collect_imports()
-    by_name: dict[str, list[Import]] = {}
+    by_name_norm: dict[str, list[Import]] = {}
     for imp in imports:
-        by_name.setdefault(imp["imported_name"], []).append(imp)
+        key = _normalize_import_name(imp["imported_name"]) if imp.get("imported_name") else ""
+        if key:
+            by_name_norm.setdefault(key, []).append(imp)
 
     indicators: list[ProtectionIndicator] = []
     for category, names in suspicious.items():
         for name in names:
-            if name not in by_name:
+            norm = _normalize_import_name(name)
+            if norm not in by_name_norm:
                 continue
-            for imp in by_name[name]:
+            for imp in by_name_norm[norm]:
                 try:
                     ea = parse_address(imp["address"])
                 except Exception:
                     continue
                 addresses = _get_xrefs_to_ea(ea, 64)
-                indicators.append(ProtectionIndicator(
+                indicator: ProtectionIndicator = ProtectionIndicator(
                     category=category,
-                    name=f"{imp['module']}!{name}",
+                    name=f"{imp['module']}!{imp['imported_name']}",
                     evidence=[f"import@{imp['address']}"] + (addresses[:1] if addresses else []),
-                    addresses=addresses if addresses else None,  # type: ignore
                     confidence="medium",
-                ))
+                )
+                if addresses:
+                    indicator["addresses"] = addresses
+                indicators.append(indicator)
     return indicators
 
 @jsonrpc
@@ -2820,19 +2857,37 @@ def find_timing_and_cpu_checks() -> list[ProtectionIndicator]:
 def detect_protections() -> list[ProtectionIndicator]:
     """Aggregate protection indicators (imports, strings, sections, instructions)"""
     results: list[ProtectionIndicator] = []
+    errors: list[str] = []
     try:
         results += list_suspicious_apis()
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append(f"list_suspicious_apis: {e}")
     try:
         results += find_anti_vm_artifacts()
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append(f"find_anti_vm_artifacts: {e}")
     try:
         results += find_timing_and_cpu_checks()
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append(f"find_timing_and_cpu_checks: {e}")
+    if errors:
+        results.append(ProtectionIndicator(category="diagnostic", name="errors", evidence=errors))
     return results
+
+@jsonrpc
+@idaread
+def detect_protections_debug() -> dict:
+    """Diagnostics for protection detection: imports collected and normalization preview"""
+    imports = _collect_imports()
+    sample = []
+    for imp in imports[:50]:
+        sample.append({
+            "module": imp.get("module"),
+            "name": imp.get("imported_name"),
+            "normalized": _normalize_import_name(imp.get("imported_name", "")),
+            "address": imp.get("address"),
+        })
+    return {"imports_total": len(imports), "imports_sample": sample}
 
 @jsonrpc
 @idaread

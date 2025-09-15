@@ -44,6 +44,7 @@ Available functionality:
 - `find_timing_and_cpu_checks()`: Find RDTSC/CPUID/syscall/int 2e usage heuristics.
 - `detect_protections()`: Aggregate protection indicators (imports, strings, sections, instructions).
 - `summarize_protections()`: Summarize protection indicators by category and name.
+- `detect_protections_debug()`: Diagnostics for protection detection (imports sample, normalized names).
 - `find_bytes(pattern, start, end, max_results)`: Find byte patterns (supports wildcards) and return addresses.
 - `patch_bytes(address, hex_bytes)`: Patch raw bytes at an address.
 - `create_function(address)`: Create a function at the given address.
@@ -137,6 +138,11 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
 
 Ethical note: These detection features are intended for defensive reverse engineering, malware analysis, and compatibility research. Do not use them to violate software licenses, bypass DRM/anti-cheat of live services, or engage in unlawful activity. Always ensure you have authorization and comply with applicable laws/ToS.
+
+Troubleshooting detection:
+- Run `detect_protections_debug()` to inspect collected imports and name normalization.
+- On ELF, imports may appear via PLT/GOT; this plugin scans `.plt`/`.plt.sec` as a fallback.
+- If nothing shows but you expect signals, ensure analysis finished (`idalib-mcp` uses `auto_wait`).
 
 ## SSE Transport & Headless MCP
 
